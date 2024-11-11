@@ -2,6 +2,8 @@ import random
 import numpy as np
 
 """
+[NON UTILISE PAR GARDIEN]
+
 Plusieurs choix ont été faits:
 
 - codage du génotype: même codage que le planning, ie une liste qui accole les gardes et les astreintes.
@@ -90,7 +92,7 @@ def recherche_algo_genetique(taille_population, nb_generations, taux_mutation, g
             indices_tournoi = random.sample(range(taille_population), k)
             return population[min(indices_tournoi, key=lambda i: fitness[i])]
 
-        # sélection des parents par roulette
+        # sélection des parents par roulette (après plusieurs tests, les tournois sont meilleurs)
         def selection_roulette():
             somme_fitness = sum(fitness)
             

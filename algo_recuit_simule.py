@@ -3,6 +3,8 @@ import numpy as np
 from definition import GestionnairePlanning
 
 """
+[NON UTILISE PAR GARDIEN]
+
 Plusieurs choix ont été fait:
 
 -pour le voisinage, on choisit de changer une garde ou une astreinte (on change de praticien une garde ou astreinte aléatoire)
@@ -17,28 +19,24 @@ Note: comme on manipule des vecteurs numpy (les solutions/plannings), on fait de
 pour éviter de mauvaises surprises.
 """
 
-def planning_voisin(planning, gplan, creneau_a_modifier=None):
+def planning_voisin(planning, gplan):
     """
     fonction qui retourne une solution voisine
     (on échange juste le médecin d'une garde aléatoire)
     """
     voisin = planning.copy()
-    if creneau_a_modifier is None:
-        creneau_a_modifier = np.random.randint(0, len(planning))
+    creneau_a_modifier = np.random.randint(0, len(planning))
     nouveau_mdc = gplan.random_mdc()
     voisin[creneau_a_modifier] = nouveau_mdc
     return voisin
 
-def recherche_recuit_simule(nb_iters_cycle, T_0, a, gplan: GestionnairePlanning, sol=None, max_dist=None, changer_jour=None):
+def recherche_recuit_simule(nb_iters_cycle, T_0, a, gplan: GestionnairePlanning, sol=None):
     """
     Recherche un planning qui minimise le critère défini dans definition.py par recuit simulé.
     Renvoie le meilleur individu trouvé pendant toute la recherche, et la liste des critères obtenus au fil de la recherche.
     """
-
-    assert not(max_dist is not None and sol is None), "une solution initiale doit être donnée pour que max_dist ait un sens"
-    assert not(changer_jour is not None and sol is None), "une solution initiale doit être donnée pour que changer_jour ait un sens"
-    assert not(changer_jour is not None and max_dist is None), "une distance max doit être donnée pour que changer_jour ait un sens"
-
+    
+    # si une sol initiale est passée, on la prend. sinon on la génère aléatoirement
     if sol is None:
         sol = gplan.solution_initiale()
     else:
@@ -53,6 +51,8 @@ def recherche_recuit_simule(nb_iters_cycle, T_0, a, gplan: GestionnairePlanning,
     T = T_0
     scores = []
 
+    # on fait plusieurs cycles de température (T_0->0) tant qu'on trouve des amélioration
+    # dans chaque cycle, on fait nb_iters_cycle
     while nouveau_cycle:
         nb_iter = 0
         nouveau_cycle = False
@@ -61,29 +61,20 @@ def recherche_recuit_simule(nb_iters_cycle, T_0, a, gplan: GestionnairePlanning,
             k += 1
             nb_iter += 1
 
-            if max_dist:
-                dist = max_dist+1
-                jour_change = False
-                while dist > max_dist and (not jour_change):
-                    voisin = planning_voisin(sol, gplan, changer_jour)
-                    voisin = gplan.forcer_contrainte(voisin)
-                    dist = gplan.distance_sol(voisin, sol_ref)
-                    if changer_jour is not None:
-                        jour_change = not(voisin[changer_jour] == sol_ref[changer_jour])
-                    else:
-                        jour_change = True
-            else:
-                voisin = planning_voisin(sol, gplan)
-                voisin = gplan.forcer_contrainte(voisin)
+            # génération d'un voisin
+            voisin = planning_voisin(sol, gplan)
+            voisin = gplan.forcer_contrainte(voisin)
             voisin_critere = gplan.calcule_critere(voisin)
 
+            # différence de critère entre le voisin et notre sol actuelle
             df = voisin_critere - sol_critere
 
+            # le voisin est meilleur: on l'accepte
             if df < 0:
                 sol = voisin
                 sol_critere = voisin_critere
                 nouveau_cycle = True
-            else:
+            else: # sinon, on l'accepte mais avec une probabilité (qui dépend de df et T)
                 prob = np.exp(-df/T)
                 q = np.random.uniform()
 
@@ -98,6 +89,6 @@ def recherche_recuit_simule(nb_iters_cycle, T_0, a, gplan: GestionnairePlanning,
         
         scores.append(meilleur_critere)
         
-        T = a * T
+        T = a * T # on refroidie / baisse la température
 
     return meilleur_sol, scores

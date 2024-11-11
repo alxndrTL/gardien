@@ -3,52 +3,58 @@ import numpy as np
 
 from config import *
 
-# TODO faire des check si mdc_dispo est bien non vide avant de sample, et quid du cas ou vide ??
-# TODO modifier comments bizarres
-# TODO commentaires complets
-
 """
-Permet de manipuler des plannings facilement : création, détection de contrainte,
-fixer les contraintes, calculer le critère.
+Permet de manipuler des plannings facilement : création, détection de contrainte, fixer les contraintes, calculer le critère.
 
 On représente un planning de {gardes, astreintes} par un vecteur de longueur 2D
 où D est le nombre total de couples (garde, astreinte) à distribuer.
 Chaque nombre qui compose le planning indique quel mdc effectue la garde/astreinte concernée.
 On peut facilement en déduire le planning des gardes et celui des astreintes en coupant en 2.
 
-La contrainte pour un planning donné est d'empêcher un mdc de travailler au lendemain d'une garde.
-Il ne peut pas donc enchaîne une autre garde, ou bien même une autre astreinte.
-On implémente cela avec la fonction detecte_contrainte et forcer_contrainte.
+Les contraintes dures pour un planning donné sont:
+- d'empêcher un mdc de travailler au lendemain d'une garde (désactivable dans config.py)
+- d'empêcher un médecin de faire garde+astreinte en même temps
+- ne pas modifier un médecin d'une garde ou astreinte "soulignée", c'est-à-dire fixée par l'utilisateur
+- modifier un médecin d'une garde ou astreinte "en gras", c'est-à-dire à modifier (selon l'utilisateur)
+On implémente cela avec les fonctions detecte_contrainte et forcer_contrainte.
 
-Le critère pour un planning donné évalue à quel point le planning respecte les préférences des mdc.
-preferences est un tableau de taille (N, D) avec N le nombre de mdc, D le nombre de gardes.
-Chaque mdc indique pour chaque garde sa préférence de travail : négatif = ne veut pas, positif = veut.
+Le critère pour un planning donné est :
+- à quel point le planning respecte les préférences des mdc
+- les attributs sont correctement représentés
+- un "soft critère" (cf calcule_soft_critere) qui calcule des choses plus subtiles comme la distribution des gardes, les écarts etc
+
+Les préférences sont représentées par un tableau de taille (N, D) avec N le nombre de mdc, D le nombre de gardes.
+Chaque mdc indique pour chaque garde sa préférence de travail : négatif = ne veut pas, positif = veut. (avec graduation possible)
+Note : les préférences concernant les gardes et non les astreintes. Toutefois, une préférence très fortement négative évitera aussi les astreintes. (cf SEUIL_PREF_NEG_ASTREINTE)
 On implémente cela avec la foncton calcule_critere.
 """
 class GestionnairePlanning:
-    def __init__(self, nombre_mdc, nombre_gardes, preferences=None, reductions=None, attributs=None, jours_gras=None, planning_initial=None):
+    def __init__(self, nombre_mdc, nombre_gardes, preferences=None, reductions=None, attributs=None, implications=None, jours_gras=None, jours_soulignes=None, planning_initial=None):
         self.N = nombre_mdc
-        self.D = nombre_gardes # aussi égal à nombre_astreintes
+        self.D = nombre_gardes # aussi égal au nombre d'astreintes
 
-        self.jours_gras = jours_gras if jours_gras else {'garde': [], 'astreinte': []}
-        self.planning_initial = planning_initial.copy() if planning_initial else None
+        self.jours_gras = jours_gras if jours_gras else {'garde': [], 'astreinte': []} # jours à modifier
+        self.jours_soulignes = jours_soulignes if jours_soulignes else {'garde': [], 'astreinte': []} # jours à fixer
+        self.planning_initial = planning_initial.copy() if planning_initial else None # on garde le planning initial en mémoire pour calculer la distance
 
         # preferences est un tableau de taille (NxD).
         # ie chaque mdc spécifie sa préférence concernant chaque jour
-        if preferences is None:
-            while True:
-                preferences = np.random.randint(low=-1, high=3, size=(self.N, self.D))
-                if not np.any(np.all(preferences == -1, axis=0)):
-                    break
         self.preferences = preferences
-
+        
+        # reductions compte, pour chaque mdc, le nombre d'équipes auquel il appartient
+        # permet alors de réduire son implication pour chaque planning
+        # [NOTE : comportement désactivé lorsque des nombres cibles de gardes et d'astreintes sont donnés]
         if reductions is None:
             reductions = np.ones((self.N,))
         self.reductions = reductions
 
+        # attributs des médecins (ex: CCV)
         if attributs is None:
             attributs = {}  # dictionnaire vide si pas d'attributs
         self.attributs = attributs  # format: {nom_attribut: list[bool]} où list[bool] de taille N
+
+        # répertorie les implications pour chaque mdc (nombre cible de gardes et nombre cible d'astreintes à distribuer)
+        self.implications = implications
 
     def random_mdc(self):
         """
@@ -62,34 +68,34 @@ class GestionnairePlanning:
         Dans un planning, retourne True si :
         -la contrainte de "jour off après la garde" n'est pas respectée
         (ie, un mdc ne doit pas travailler (ni garde ni astreinte) après une garde)
+        -un médecin travaille en garde et en astreinte le même jour
         -un médecin est réaffecté à un jour en gras où il était déjà affecté dans le planning initial
+        -un médecin a été déplacé d'une garde/astreinte soulignée (fixée)
+
+        Si aucune contrainte n'est pas respectée, return False
         """
 
         planning_gardes = planning[:self.D]
         planning_astreintes = planning[self.D:]
 
+        # si le premier jour, le même mdc fait garde et astreinte -> True
         if planning_gardes[0] == planning_astreintes[0]:
             return True
-
-        # Vérifier qu'aucune modification n'est faite avant le jour de début autorisé
-        if self.planning_initial is not None and self.jours_gras.get('jour_debut_modif', -1) != -1:
-            jour_debut = self.jours_gras['jour_debut_modif']
-            for t in range(jour_debut):
-                if planning_gardes[t] != self.planning_initial[t] or planning_astreintes[t] != self.planning_initial[self.D + t]:
-                    return True
         
+        # vérification contrainte "jour off"
         if ENABLE_OFF_AFTER_GARDE:
             for (last_mdc, mdc, mdc_astreinte) in zip(planning_gardes, planning_gardes[1:], planning_astreintes[1:]):
                 if last_mdc == mdc:
                     return True
                 elif last_mdc == mdc_astreinte:
                     return True
-        
+                
+        # vérification contrainte "médecin fait garde et astreinte"
         for (mdc_garde, mdc_astreinte) in zip(planning_gardes, planning_astreintes):
             if mdc_garde == mdc_astreinte:
                 return True
         
-        # Contrainte de non réaffectation des médecins aux jours en gras
+        # vérification contrainte de non réaffectation des jours gras
         if self.planning_initial is not None:
             planning_initial_gardes = self.planning_initial[:self.D]
             planning_initial_astreintes = self.planning_initial[self.D:]
@@ -101,23 +107,38 @@ class GestionnairePlanning:
             for jour in self.jours_gras['astreinte']:
                 if planning_astreintes[jour] == planning_initial_astreintes[jour]:
                     return True
+                
+        # vérification contrainte de fixation des jours soulignés
+        if self.planning_initial is not None:
+            planning_initial_gardes = self.planning_initial[:self.D]
+            planning_initial_astreintes = self.planning_initial[self.D:]
+
+            for jour in self.jours_soulignes['garde']:
+                if planning_gardes[jour] != planning_initial_gardes[jour]:
+                    return True
+                
+            for jour in self.jours_soulignes['astreinte']:
+                if planning_astreintes[jour] != planning_initial_astreintes[jour]:
+                    return True
         
         return False
 
     def forcer_contrainte(self, planning):
         """
-        Dans un planning, détecte si la contrainte de "jour off après la garde" n'est pas respectée
-        A chaque fois qu'il y a 2 apparitions consécutives d'un même praticien (GG ou GA), la fonction remplace la 2nd apparition par un autre praticien.
-        La planning renvoyé respecte la contrainte.
-
-        force le respect des contraintes:
-        - "jour off après la garde"
+        Force le respect des contraintes:
+        - jour off après la garde
+        - médecin différent pour la garde et pour l'astreinte d'un même jour
         - non réaffectation des médecins aux jours en gras
+        - non modifications des médecins aux jours soulignés
+
+        Le forçage de contrainte se fait en remplaçant les médecins des jours problématiques par d'autres médecins (qui conviennent)
+        La planning renvoyé respecte la contrainte.
         """
 
         planning_gardes = planning[:self.D].copy()
         planning_astreintes = planning[self.D:].copy()
 
+        # empeche la réaffection des médecins aux jours en gras
         for t in range(len(planning_gardes)):
             if self.planning_initial is not None and t in self.jours_gras['garde']:
                 if planning_gardes[t] == self.planning_initial[t]:
@@ -130,11 +151,30 @@ class GestionnairePlanning:
                     mdc_dispo = list(range(self.N)) # liste des mdc parmis lesquels on va tirer au sort
                     mdc_dispo.remove(planning_astreintes[t]) 
                     planning_astreintes[t] = random.choice(mdc_dispo)
+        
+        # forcer les jours soulignés à rester identiques au planning initial
+        for t in range(len(planning_gardes)):
+            if self.planning_initial is not None and t in self.jours_soulignes['garde']:
+                if planning_gardes[t] != self.planning_initial[t]:
+                    planning_gardes[t] = self.planning_initial[t]
 
+            if self.planning_initial is not None and t in self.jours_soulignes['astreinte']:
+                if planning_astreintes[t] != self.planning_initial[self.D + t]:
+                    planning_astreintes[t] = self.planning_initial[self.D + t]
+
+        # forcer la contrainte "jour off après la garde"
         if ENABLE_OFF_AFTER_GARDE:
             for t in range(1, len(planning_gardes)):
+
                 # un mdc fait deux gardes d'affilé (GG)
-                if planning_gardes[t] == planning_gardes[t-1]:
+                if planning_gardes[t] == planning_gardes[t-1] and t in self.jours_soulignes['garde']:
+                    if t-1 in self.jours_soulignes['garde']:
+                        break
+                    else:
+                        mdc_dispo = list(range(self.N))
+                        mdc_dispo.remove(planning_gardes[t])
+                        planning_gardes[t-1] = random.choice(mdc_dispo)
+                if planning_gardes[t] == planning_gardes[t-1] and t not in self.jours_soulignes['garde']:
                     mdc_dispo = list(range(self.N)) # liste des mdc parmis lesquels on va tirer au sort
                     mdc_dispo.remove(planning_gardes[t]) # on retire celui qui est en jour off
                     
@@ -142,16 +182,36 @@ class GestionnairePlanning:
                         if planning_gardes[t+1] in mdc_dispo:
                             mdc_dispo.remove(planning_gardes[t+1])
 
-                    # Si c'est un jour en gras, interdire de réutiliser le médecin initial
+                    # si c'est un jour en gras, interdire de réutiliser le médecin initial
                     if self.planning_initial is not None and t in self.jours_gras['garde']:
                         mdc_initial = self.planning_initial[t]
                         if mdc_initial != -1 and mdc_initial in mdc_dispo:
                             mdc_dispo.remove(mdc_initial)
+
+                    # si le lendemain est un jour souligné, gérer le cas
+                    if self.planning_initial is not None and (t < len(planning_gardes)-1):
+                        if t+1 in self.jours_soulignes['garde']:
+                            if self.planning_initial[t+1] in mdc_dispo:
+                                mdc_dispo.remove(self.planning_initial[t+1]) # on empeche de prendre un mdc qui a une garde fixé le lendemain 
+                        if t+1 in self.jours_soulignes['astreinte']:
+                            if self.planning_initial[self.D+t+1] in mdc_dispo:
+                                mdc_dispo.remove(self.planning_initial[self.D+t+1]) # on empeche de prendre un mdc qui a une astreinte fixée le lendemain
                     
-                    planning_gardes[t] = random.choice(mdc_dispo) # on tire au sort un mdc
+                    if mdc_dispo:
+                        planning_gardes[t] = random.choice(mdc_dispo) # on tire au sort un mdc
+                    else:
+                        raise Exception(f"\033[1m\033[31m[ERREUR]\033[0m Aucun médecin disponible pour l'astreinte au temps {t}. Vous pouvez essayer de relancer l'algorithme.")
+
 
                 # un mdc fait une garde suivie par une astreinte (GA)
-                if planning_astreintes[t] == planning_gardes[t-1]:
+                if planning_astreintes[t] == planning_gardes[t-1] and t in self.jours_soulignes['astreinte']:
+                    if t-1 in self.jours_soulignes['garde']:
+                        break
+                    else:
+                        mdc_dispo = list(range(self.N))
+                        mdc_dispo.remove(planning_astreintes[t])
+                        planning_gardes[t-1] = random.choice(mdc_dispo)
+                if planning_astreintes[t] == planning_gardes[t-1] and t not in self.jours_soulignes['astreinte']:
                     mdc_dispo = list(range(self.N)) # liste des mdc parmis lesquels on va tirer au sort
                     mdc_dispo.remove(planning_astreintes[t]) # on retire celui qui est en jour off
                     
@@ -159,14 +219,18 @@ class GestionnairePlanning:
                         if planning_gardes[t+1] in mdc_dispo:
                             mdc_dispo.remove(planning_gardes[t+1])
 
-                    # Si c'est un jour en gras, interdire de réutiliser le médecin initial
+                    # si c'est un jour en gras, interdire de réutiliser le médecin initial
                     if self.planning_initial is not None and t in self.jours_gras['astreinte']:
                         mdc_initial = self.planning_initial[self.D + t]
                         if mdc_initial != -1 and mdc_initial in mdc_dispo:
                             mdc_dispo.remove(mdc_initial)
                     
-                    planning_astreintes[t] = random.choice(mdc_dispo) # on tire au sort un mdc
+                    if mdc_dispo:
+                        planning_astreintes[t] = random.choice(mdc_dispo) # on tire au sort un mdc
+                    else:
+                        raise Exception(f"\033[1m\033[31m[ERREUR]\033[0m Aucun médecin disponible pour l'astreinte au temps {t}. Vous pouvez essayer de relancer l'algorithme.")
 
+        # forcer la contrainte "même médecin en garde et en astreinte"
         for t in range(len(planning_gardes)):
             if planning_gardes[t] == planning_astreintes[t]:
                 mdc_dispo = list(range(self.N))
@@ -175,29 +239,22 @@ class GestionnairePlanning:
                 if t > 0 and planning_gardes[t-1] in mdc_dispo:
                     mdc_dispo.remove(planning_gardes[t-1])
 
-                # Si c'est un jour en gras, interdire de réutiliser le médecin initial
+                # si c'est un jour en gras, interdire de réutiliser le médecin initial
                 if self.planning_initial is not None and t in self.jours_gras['astreinte']:
                     mdc_initial = self.planning_initial[self.D + t]
                     if mdc_initial != -1 and mdc_initial in mdc_dispo:
                         mdc_dispo.remove(mdc_initial)
 
-                # Assure qu'il y a un médecin disponible
                 if mdc_dispo:
                     planning_astreintes[t] = random.choice(mdc_dispo)
                 else:
-                    raise Exception(f"Aucun médecin disponible pour l'astreinte au temps {t}")
-                
-        # Forcer les jours avant jour_debut_modif à rester identiques au planning initial
-        if self.planning_initial is not None and self.jours_gras.get('jour_debut_modif', -1) != -1:
-            jour_debut = self.jours_gras['jour_debut_modif']
-            planning_gardes[:jour_debut] = self.planning_initial[:jour_debut]
-            planning_astreintes[:jour_debut] = self.planning_initial[self.D:self.D + jour_debut]
+                    raise Exception(f"\033[1m\033[31m[ERREUR]\033[0m Aucun médecin disponible pour l'astreinte au temps {t}. Vous pouvez essayer de relancer l'algorithme.")
 
         return np.concatenate((planning_gardes, planning_astreintes))
 
     def solution_initiale(self):
         """
-        Renvoie un planning généré aléatoirement (mais qui respecte la contrainte jour off)
+        Renvoie un planning généré aléatoirement (mais qui respecte les contraintes)
         """
         A = [self.random_mdc() for _ in range(2*self.D)] # construction du planning : d'abord les gardes puis les astreintes
         B = self.forcer_contrainte(A) # on applique la contrainte
@@ -214,22 +271,26 @@ class GestionnairePlanning:
         critere = 0
 
         # respect des préférences des mdc qui ont une garde
-        preferences_mdc_gardes = self.preferences[planning_gardes, np.arange(self.D)]
-        for pref in preferences_mdc_gardes:
-            if pref < 0:
-                critere += PENALITE_CRITERE_PREF_NEG*(pref**2)
-            elif pref == 0:
-                critere += PENALITE_CRITERE_PREF_NULLE
-            else:
-                critere -= BONUS_CRITERE_PREF_POS*pref**2
+        for jour in range(self.D):
+            if jour not in self.jours_soulignes['garde']:
+                mdc = planning_gardes[jour]
+                pref = self.preferences[mdc, jour]
+                if pref < 0:
+                    critere += PENALITE_CRITERE_PREF_NEG*(pref**2)
+                elif pref == 0:
+                    critere += PENALITE_CRITERE_PREF_NULLE
+                else:
+                    critere -= BONUS_CRITERE_PREF_POS*pref**2
 
-        # respect des préférences des mdc qui ont une astreinte (seulement si grosse préf négative)
-        preferences_mdc_astreintes = self.preferences[planning_astreintes, np.arange(self.D)]
-        for pref in preferences_mdc_astreintes:
-            if pref < -5:
-                critere += PENALITE_CRITERE_PREF_NEG*(pref**2)
+        # respect des préférences des mdc qui ont une astreinte (seulement si grosse préf négative, <SEUIL_PREF_NEG_ASTREINTE)
+        for jour in range(self.D):
+            if jour not in self.jours_soulignes['astreinte']:
+                mdc = planning_astreintes[jour]
+                pref = self.preferences[mdc, jour]
+                if pref < SEUIL_PREF_NEG_ASTREINTE:
+                    critere += PENALITE_CRITERE_PREF_NEG*(pref**2)
 
-        # Pénalités pour les attributs non respectés
+        # pénalités pour les attributs non respectés
         for _, (mdc_garde, mdc_astreinte) in enumerate(zip(planning_gardes, planning_astreintes)):
             critere += self.penalite_attributs(mdc_garde, mdc_astreinte)
 
@@ -259,18 +320,20 @@ class GestionnairePlanning:
                     critere += PENALITE_CRITERE_ECART / ecart
 
         # pénaliser une mauvaise répartition des gardes/astreintes entre les mdc
-        nb_positifs_par_mdc = (self.preferences > 0).sum(axis=1) # (N,)
-        # gardes
-        target_nb_gardes_par_mdc = self.D * ((nb_positifs_par_mdc/self.reductions) / np.sum(nb_positifs_par_mdc/self.reductions)) # (N,)    
+        # (cf guide d'utilisateur pour plus de détais sur cette stratégie)
+        if self.implications is None:
+            nb_positifs_par_mdc = (self.preferences > 0).sum(axis=1) # (N,)
+            target_nb_gardes_par_mdc = self.D * ((nb_positifs_par_mdc/self.reductions) / np.sum(nb_positifs_par_mdc/self.reductions)) # (N,)
+            target_nb_astreintes_par_mdc = self.D * ((nb_positifs_par_mdc/self.reductions) / np.sum(nb_positifs_par_mdc/self.reductions)) # (N,)
+        else:
+            target_nb_gardes_par_mdc = self.implications['gardes']
+            target_nb_astreintes_par_mdc = self.implications['astreintes']   
 
         nb_gardes_par_mdc = np.zeros(self.N, dtype=int)
         for mdc in planning_gardes:
             nb_gardes_par_mdc[mdc] += 1
 
         critere += PENALITE_CRITERE_MAUVAISE_REPART * np.sum((target_nb_gardes_par_mdc - nb_gardes_par_mdc)**2)
-
-        # idem pour les astreintes
-        target_nb_astreintes_par_mdc = self.D * ((nb_positifs_par_mdc/self.reductions) / np.sum(nb_positifs_par_mdc/self.reductions)) # (N,)
 
         nb_astreintes_par_mdc = np.zeros(self.N, dtype=int)
         for mdc in planning_astreintes:
@@ -287,15 +350,20 @@ class GestionnairePlanning:
         """
         penalite = 0
         
-        # Pour chaque attribut requis
+        # loop sur les attributs
         for _, mdc_avec_attribut in self.attributs.items():
-            # Au moins un des deux médecins doit avoir l'attribut
+            # au moins un des deux médecins doit avoir l'attribut
             if not (mdc_avec_attribut[mdc_garde] or mdc_avec_attribut[mdc_astreinte]):
                 penalite += PENALITE_CRITERE_ATTRIBUT_MANQUANT # même ordre de grandeur que les préférences très négatives
         
         return penalite
     
     def distance_sol(self, planning, planning_ref):
+        """
+        Renvoie la distance entre deux plannings.
+        (distance de Hamming, cf papier section 6.2.2)
+        """
+
         planning_gardes = planning[:self.D]
         planning_astreintes = planning[self.D:]
 
@@ -310,6 +378,8 @@ class GestionnairePlanning:
     
     def infos_planning(self, planning):
         """
+        Donne des informations générales sur le planning [NON UTILISE PAR GARDIEN]
+        
         Calcule différentes caractéristiques d'un planning
         calculer le nombre de -1 attribués en garde (idéalement 0)
         calculer le nombre de 0 attribués en garde (idéalement 0)
@@ -360,12 +430,9 @@ class GestionnairePlanning:
             # Trouver les jours où le mdc a une garde
             jours_mdc = np.where(np.array(planning_gardes) == mdc)[0]
             if len(jours_mdc) > 1:
-                # Calculer les écarts entre les gardes successives
-                ecarts = np.diff(jours_mdc)
-                # Calculer l'écart moyen
-                ecart_moyen = np.mean(ecarts)
+                ecarts = np.diff(jours_mdc) # écarts entre les gardes successives
+                ecart_moyen = np.mean(ecarts) # écart moyen
             else:
-                # S'il y a une seule garde ou aucune, l'écart moyen est défini comme None
                 ecart_moyen = None
             ecart_moyen_gardes_par_mdc.append(ecart_moyen)
 
